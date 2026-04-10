@@ -22,7 +22,7 @@ namespace FORWARD
 {
 	// Perform initial steps for each Gaussian prior to rasterization.
 	void preprocess(int P, int D, int M,
-		const float* orig_points,
+		const float* means3D,
 		const glm::vec2* scales,
 		const float scale_modifier,
 		const glm::vec4* rotations,
@@ -34,16 +34,14 @@ namespace FORWARD
 		const float* viewmatrix,
 		const float* projmatrix,
 		const glm::vec3* cam_pos,
-		const int W, int H,
-		const float focal_x, float focal_y,
-		const float tan_fovx, float tan_fovy,
+		const int W, const int H,
+		const float focal_x, const float focal_y,
+		const float tan_fovx, const float tan_fovy,
 		int* radii,
-		float2* points_xy_image,
+		float2* means2D,
 		float* depths,
-		// float* isovals,
-		// float3* normals,
 		float* transMats,
-		float* colors,
+		float* rgb,
 		float4* normal_opacity,
 		const dim3 grid,
 		uint32_t* tiles_touched,
@@ -54,9 +52,10 @@ namespace FORWARD
 		const dim3 grid, dim3 block,
 		const uint2* ranges,
 		const uint32_t* point_list,
-		int W, int H,
+		const int S, int W, int H,
 		float focal_x, float focal_y,
-		const float2* points_xy_image,
+		const float2* means2D,
+		const float* colors,
 		const float* features,
 		const float* transMats,
 		const float* depths,
@@ -65,8 +64,10 @@ namespace FORWARD
 		uint32_t* n_contrib,
 		const float* bg_color,
 		float* out_color,
+		float* out_feature,
 		float* out_others);
 }
+
 
 
 #endif

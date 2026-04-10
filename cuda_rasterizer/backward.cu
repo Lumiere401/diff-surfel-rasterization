@@ -145,23 +145,27 @@ __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
-	int W, int H,
+	int S, int W, int H,
 	float focal_x, float focal_y,
 	const float* __restrict__ bg_color,
 	const float2* __restrict__ points_xy_image,
 	const float4* __restrict__ normal_opacity,
 	const float* __restrict__ transMats,
 	const float* __restrict__ colors,
+	const float* __restrict__ features, //
 	const float* __restrict__ depths,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
+    const float* __restrict__ dL_dpixels_f, //
 	const float* __restrict__ dL_depths,
 	float * __restrict__ dL_dtransMat,
 	float3* __restrict__ dL_dmean2D,
 	float* __restrict__ dL_dnormal3D,
 	float* __restrict__ dL_dopacity,
-	float* __restrict__ dL_dcolors)
+	float* __restrict__ dL_dcolors,
+    float* __restrict__ dL_dfeature
+	)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -170,7 +174,7 @@ renderCUDA(
 	const uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
 	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
 	const uint32_t pix_id = W * pix.y + pix.x;
-	const float2 pixf = {(float)pix.x, (float)pix.y};
+	const float2 pixf = { (float)pix.x, (float)pix.y };
 
 	const bool inside = pix.x < W&& pix.y < H;
 	const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
@@ -184,6 +188,7 @@ renderCUDA(
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_normal_opacity[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
+	__shared__ float collected_features[MAX_FEATURES * BLOCK_SIZE]; //
 	__shared__ float3 collected_Tu[BLOCK_SIZE];
 	__shared__ float3 collected_Tv[BLOCK_SIZE];
 	__shared__ float3 collected_Tw[BLOCK_SIZE];
@@ -200,7 +205,9 @@ renderCUDA(
 	const int last_contributor = inside ? n_contrib[pix_id] : 0;
 
 	float accum_rec[C] = { 0 };
+	float accum_rec_f[MAX_FEATURES] = { 0 }; // //
 	float dL_dpixel[C];
+	float dL_dpixel_f[MAX_FEATURES];
 
 #if RENDER_AXUTILITY
 	float dL_dreg;
@@ -238,11 +245,14 @@ renderCUDA(
 	if (inside){
 		for (int i = 0; i < C; i++)
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
+		for (int i = 0; i < S; i++)
+            dL_dpixel_f[i] = dL_dpixels_f[i * H * W + pix_id];  // //
 	}
 
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
-
+	float last_feature[MAX_FEATURES] = { 0 }; // //
+	
 	// Gradient of pixel coordinate w.r.t. normalized 
 	// screen-space viewport corrdinates (-1 to 1)
 	const float ddelx_dx = 0.5 * W;
@@ -267,6 +277,8 @@ renderCUDA(
 			for (int i = 0; i < C; i++)
 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
 				// collected_depths[block.thread_rank()] = depths[coll_id];
+			for (int i = 0; i < S; i++)
+                collected_features[i * BLOCK_SIZE + block.thread_rank()] = features[coll_id * S + i];  // //
 		}
 		block.sync();
 
@@ -293,14 +305,11 @@ renderCUDA(
 			float rho3d = (s.x * s.x + s.y * s.y); 
 			float2 d = {xy.x - pixf.x, xy.y - pixf.y};
 			float rho2d = FilterInvSquare * (d.x * d.x + d.y * d.y); 
-			float rho = min(rho3d, rho2d);
 
-			// compute depth
-			float c_d = (s.x * Tw.x + s.y * Tw.y) + Tw.z; // Tw * [u,v,1]
-			// if a point is too small, its depth is not reliable?
-			// c_d = (rho3d <= rho2d) ? c_d : Tw.z; 
+			// compute intersection and depth
+			float rho = min(rho3d, rho2d);
+			float c_d = (rho3d <= rho2d) ? (s.x * Tw.x + s.y * Tw.y) + Tw.z : Tw.z; 
 			if (c_d < near_n) continue;
-			
 			float4 nor_o = collected_normal_opacity[j];
 			float normal[3] = {nor_o.x, nor_o.y, nor_o.z};
 			float opa = nor_o.w;
@@ -338,6 +347,20 @@ renderCUDA(
 				// many that were affected by this Gaussian.
 				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
 			}
+
+			// // for feature
+            for (int ch = 0; ch < S; ch++)
+            {
+                const float feature = collected_features[ch * BLOCK_SIZE + j];
+
+                accum_rec_f[ch] = last_alpha * last_feature[ch] + (1.f - last_alpha) * accum_rec_f[ch];
+                last_feature[ch] = feature;
+                const float dL_dchannel_f = dL_dpixel_f[ch];
+				// dL_dalpha += (feature - accum_rec_f[ch]) * dL_dchannel_f;
+                atomicAdd(&(dL_dfeature[global_id * S + ch]), dchannel_dcolor * dL_dchannel_f);
+            }
+
+
 
 			float dL_dz = 0.0f;
 			float dL_dweight = 0;
@@ -433,10 +456,7 @@ renderCUDA(
 				const float dG_ddely = -G * FilterInvSquare * d.y;
 				atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx); // not scaled
 				atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely); // not scaled
-				// // Propagate the gradients of depth
-				atomicAdd(&dL_dtransMat[global_id * 9 + 6],  s.x * dL_dz);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 7],  s.y * dL_dz);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dz);
+				atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dz); // propagate depth loss
 			}
 
 			// Update gradients w.r.t. opacity of the Gaussian
@@ -520,19 +540,30 @@ __device__ void compute_transmat_aabb(
 	float3 dL_dmean2D = dL_dmean2Ds[idx];
 	if(dL_dmean2D.x != 0 || dL_dmean2D.y != 0)
 	{
-		glm::vec3 t_vec = glm::vec3(9.0f, 9.0f, -1.0f);
-		float d = glm::dot(t_vec, T[2] * T[2]);
-		glm::vec3 f_vec = t_vec * (1.0f / d);
-		glm::vec3 dL_dT0 = dL_dmean2D.x * f_vec * T[2];
-		glm::vec3 dL_dT1 = dL_dmean2D.y * f_vec * T[2];
-		glm::vec3 dL_dT3 = dL_dmean2D.x * f_vec * T[0] + dL_dmean2D.y * f_vec * T[1];
-		glm::vec3 dL_df = dL_dmean2D.x * T[0] * T[2] + dL_dmean2D.y * T[1] * T[2];
-		float dL_dd = glm::dot(dL_df, f_vec) * (-1.0 / d);
-		glm::vec3 dd_dT3 = t_vec * T[2] * 2.0f;
-		dL_dT3 += dL_dd * dd_dT3;
-		dL_dT[0] += dL_dT0;
-		dL_dT[1] += dL_dT1;
-		dL_dT[2] += dL_dT3;
+		const float distance = T[2].x * T[2].x + T[2].y * T[2].y - T[2].z * T[2].z;
+		const float f = 1 / (distance);
+		const float dpx_dT00 =  f * T[2].x;
+		const float dpx_dT01 =  f * T[2].y;
+		const float dpx_dT02 = -f * T[2].z;
+		const float dpy_dT10 =  f * T[2].x;
+		const float dpy_dT11 =  f * T[2].y;
+		const float dpy_dT12 = -f * T[2].z;
+		const float dpx_dT30 =  T[0].x * (f - 2 * f * f * T[2].x * T[2].x);
+		const float dpx_dT31 =  T[0].y * (f - 2 * f * f * T[2].y * T[2].y);
+		const float dpx_dT32 = -T[0].z * (f + 2 * f * f * T[2].z * T[2].z);
+		const float dpy_dT30 =  T[1].x * (f - 2 * f * f * T[2].x * T[2].x);
+		const float dpy_dT31 =  T[1].y * (f - 2 * f * f * T[2].y * T[2].y);
+		const float dpy_dT32 = -T[1].z * (f + 2 * f * f * T[2].z * T[2].z);
+
+		dL_dT[0].x += dL_dmean2D.x * dpx_dT00;
+		dL_dT[0].y += dL_dmean2D.x * dpx_dT01;
+		dL_dT[0].z += dL_dmean2D.x * dpx_dT02;
+		dL_dT[1].x += dL_dmean2D.y * dpy_dT10;
+		dL_dT[1].y += dL_dmean2D.y * dpy_dT11;
+		dL_dT[1].z += dL_dmean2D.y * dpy_dT12;
+		dL_dT[2].x += dL_dmean2D.x * dpx_dT30 + dL_dmean2D.y * dpy_dT30;
+		dL_dT[2].y += dL_dmean2D.x * dpx_dT31 + dL_dmean2D.y * dpy_dT31;
+		dL_dT[2].z += dL_dmean2D.x * dpx_dT32 + dL_dmean2D.y * dpy_dT32;
 
 		if (Ts_precomp != nullptr) {
 			dL_dTs[idx * 9 + 0] = dL_dT[0].x;
@@ -660,7 +691,7 @@ void BACKWARD::preprocess(
 	glm::vec2* dL_dscales,
 	glm::vec4* dL_drots)
 {	
-	preprocessCUDA<NUM_CHANNELS><< <(P + 255) / 256, 256 >> > (
+	preprocessCUDA<NUM_CHANNELS> << < (P + 255) / 256, 256 >> > (
 		P, D, M,
 		(float3*)means3D,
 		transMats,
@@ -692,43 +723,50 @@ void BACKWARD::render(
 	const dim3 grid, const dim3 block,
 	const uint2* ranges,
 	const uint32_t* point_list,
-	int W, int H,
+	int S, int W, int H,   // //
 	float focal_x, float focal_y,
 	const float* bg_color,
 	const float2* means2D,
 	const float4* normal_opacity,
 	const float* colors,
+	const float* features, // //
 	const float* transMats,
 	const float* depths,
 	const float* final_Ts,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
+	const float* dL_dfeatures, // //
 	const float* dL_depths,
 	float * dL_dtransMat,
 	float3* dL_dmean2D,
 	float* dL_dnormal3D,
 	float* dL_dopacity,
-	float* dL_dcolors)
+	float* dL_dcolors,
+	float* dL_dfeature // //
+	)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
 		ranges,
 		point_list,
-		W, H,
+		S, W, H,	// //
 		focal_x, focal_y,
 		bg_color,
 		means2D,
 		normal_opacity,
 		transMats,
 		colors,
+		features, // //
 		depths,
 		final_Ts,
 		n_contrib,
 		dL_dpixels,
+		dL_dfeatures, // //
 		dL_depths,
 		dL_dtransMat,
 		dL_dmean2D,
 		dL_dnormal3D,
 		dL_dopacity,
-		dL_dcolors
+		dL_dcolors,
+		dL_dfeature	// //
 		);
 }
